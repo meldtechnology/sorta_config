@@ -1,6 +1,170 @@
-serve:
+server:
   port: 8080
+  shutdown: graceful
+  max-http-request-header-size: 8KB
+
+logging:
+  level:
+    root: WARN
+    org.meldtech.platform: INFO
 
 spring:
-  profiles:
-    active: dev
+  codec:
+    max-in-memory-size: 1MB
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: ${REDIS_SSL_ENABLED:false}
+      timeout: 2000
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+          max-wait: 1000ms
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowed-origins:
+              - "http://localhost:3000"
+              - "http://localhost:3001"
+            allowed-methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            allowed-headers: "*"
+            allow-credentials: true
+      default-filters:
+        - name: RequestSize
+          args:
+            maxSize: 1MB
+        - name: NormalizePath
+      routes:
+        - id: test-service
+          uri: http://localhost:${server.port}
+          predicates:
+            - Path=/test/**
+          filters:
+            - name: JwtValidationFilter
+            - name: CorrelationIdFilter
+
+        # Route order matters: otp-service must be before auth-service to prevent shadowing
+        - id: otp-service
+          uri: ${AUTH_SERVICE_URI:http://auth-service:8081}
+          predicates:
+            - Path=/api/v1/auth/otp/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 3
+                redis-rate-limiter.burstCapacity: 5
+                redis-rate-limiter.include-headers: true
+                key-resolver: "#{@ipKeyResolver}"
+            - name: CorrelationIdFilter
+
+        - id: auth-service
+          uri: ${AUTH_SERVICE_URI:http://auth-service:8081}
+          predicates:
+            - Path=/api/v1/auth/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 5
+                redis-rate-limiter.burstCapacity: 100
+                redis-rate-limiter.include-headers: true
+                key-resolver: "#{@ipKeyResolver}"
+            - name: CorrelationIdFilter
+
+        - id: user-service
+          uri: ${USER_SERVICE_URI:http://user-service:8082}
+          predicates:
+            - Path=/api/v1/users/**
+          filters:
+            - name: JwtValidationFilter
+            - name: CorrelationIdFilter
+
+        - id: trade-service
+          uri: ${TRADE_SERVICE_URI:http://trade-service:8083}
+          predicates:
+            - Path=/api/v1/trades/**
+          filters:
+            - name: JwtValidationFilter
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+                redis-rate-limiter.include-headers: true
+                key-resolver: "#{@ipKeyResolver}"
+            - name: CorrelationIdFilter
+            - name: CircuitBreaker
+              args:
+                name: tradeServiceCB
+                fallbackUri: forward:/fallback/trade
+
+        - id: quote-service
+          uri: ${QUOTE_SERVICE_URI:http://quote-service:8084}
+          predicates:
+            - Path=/api/v1/quotes/**
+          filters:
+            - name: JwtValidationFilter
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+                redis-rate-limiter.include-headers: true
+                key-resolver: "#{@ipKeyResolver}"
+            - name: CorrelationIdFilter
+            - name: CircuitBreaker
+              args:
+                name: quoteServiceCB
+                fallbackUri: forward:/error
+
+        - id: report-service
+          uri: ${REPORT_SERVICE_URI:http://report-service:8085}
+          predicates:
+            - Path=/api/v1/reports/**
+          filters:
+            - name: JwtValidationFilter
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 2
+                redis-rate-limiter.burstCapacity: 5
+                redis-rate-limiter.include-headers: true
+                key-resolver: "#{@ipKeyResolver}"
+            - name: CorrelationIdFilter
+            - name: CircuitBreaker
+              args:
+                name: reportServiceCB
+                fallbackUri: forward:/error
+
+gateway:
+  cors:
+    allowed-origins: http://localhost:3000,http://localhost:3001
+  jwt:
+    public-key-path: ${JWT_PUBLIC_KEY_PATH:classpath:certs/public.pem}
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_URL:http://localhost:9411/api/v2/spans}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
