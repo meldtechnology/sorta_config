@@ -2,10 +2,15 @@ server:
   port: 8080
   shutdown: graceful
   max-http-request-header-size: 8KB
+  Netty:
+    connection-timeout: 3s
 
 logging:
   level:
     root: WARN
+    org.springframework.cloud.config: DEBUG
+    org.springframework.boot.context.config: DEBUG
+    org.springframework.cloud.gateway: INFO
     org.meldtech.platform: INFO
 
 spring:
@@ -43,7 +48,24 @@ spring:
               - OPTIONS
             allowed-headers: "*"
             allow-credentials: true
+      # Performance & Capacity (Task 69/72): Tune Netty HTTP client connection pools and timeouts
+      httpclient:
+        connect-timeout: 3000 # ms
+        response-timeout: 15s
+        wiretap: ${GATEWAY_HTTPCLIENT_WIRETAP:false}
+        pool:
+          # Use fixed-size pool to align with Ingress/NGINX keep-alive and backend capacity
+          type: fixed
+          max-connections: ${GATEWAY_HTTPCLIENT_MAX_CONN:200}
+          acquire-timeout: 45s
+          # optional lifetimes to avoid stale connections after load balancer rotations
+          max-idle-time: 30s
+          max-life-time: 5m
       default-filters:
+        - name: RemoveRequestHeader
+          args:
+            name: Cookie
+        # other default filters can be appended here
         - name: RequestSize
           args:
             maxSize: 1MB
@@ -63,58 +85,87 @@ spring:
           predicates:
             - Path=/api/v1/auth/otp/**
           filters:
+            - RewritePath=/api/v1/auth/(?<segment>.*), /${segment}
             - name: RequestRateLimiter
               args:
                 redis-rate-limiter.replenishRate: 3
                 redis-rate-limiter.burstCapacity: 5
                 redis-rate-limiter.include-headers: true
                 key-resolver: "#{@ipKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
             - name: CorrelationIdFilter
+          metadata:
+            owner: security-team
+            sla: P1
 
         - id: auth-service
           uri: ${AUTH_SERVICE_URI:http://auth-service:8081}
           predicates:
             - Path=/api/v1/auth/**
           filters:
+            - RewritePath=/api/v1/auth/(?<segment>.*), /${segment}
             - name: RequestRateLimiter
               args:
                 redis-rate-limiter.replenishRate: 5
                 redis-rate-limiter.burstCapacity: 100
                 redis-rate-limiter.include-headers: true
                 key-resolver: "#{@ipKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
             - name: CorrelationIdFilter
+          metadata:
+            owner: security-team
+            sla: P1
 
         - id: user-service
           uri: ${USER_SERVICE_URI:http://user-service:8082}
           predicates:
             - Path=/api/v1/users/**
           filters:
+            - RewritePath=/api/v1/users/(?<segment>.*), /${segment}
             - name: JwtValidationFilter
             - name: CorrelationIdFilter
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+                redis-rate-limiter.includeHeaders: true
+              metadata:
+                owner: accounts-team
+                sla: P2
 
         - id: trade-service
           uri: ${TRADE_SERVICE_URI:http://trade-service:8083}
           predicates:
             - Path=/api/v1/trades/**
           filters:
+            - RewritePath=/api/v1/trades/(?<segment>.*), /${segment}
             - name: JwtValidationFilter
             - name: RequestRateLimiter
               args:
                 redis-rate-limiter.replenishRate: 50
                 redis-rate-limiter.burstCapacity: 100
                 redis-rate-limiter.include-headers: true
-                key-resolver: "#{@ipKeyResolver}"
+                key-resolver: "#{@userKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
             - name: CorrelationIdFilter
             - name: CircuitBreaker
               args:
                 name: tradeServiceCB
                 fallbackUri: forward:/fallback/trade
+          metadata:
+            owner: trading-team
+            sla: P1
+            response-timeout: 15s
+            connect-timeout: 3s
 
         - id: quote-service
           uri: ${QUOTE_SERVICE_URI:http://quote-service:8084}
           predicates:
             - Path=/api/v1/quotes/**
           filters:
+            - RewritePath=/api/v1/quotes/(?<segment>.*), /${segment}
             - name: JwtValidationFilter
             - name: RequestRateLimiter
               args:
@@ -122,40 +173,95 @@ spring:
                 redis-rate-limiter.burstCapacity: 100
                 redis-rate-limiter.include-headers: true
                 key-resolver: "#{@ipKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
             - name: CorrelationIdFilter
             - name: CircuitBreaker
               args:
                 name: quoteServiceCB
                 fallbackUri: forward:/error
+          metadata:
+            owner: trading-team
+            sla: P1
+            response-timeout: 15s
+            connect-timeout: 3s
 
         - id: report-service
           uri: ${REPORT_SERVICE_URI:http://report-service:8085}
           predicates:
             - Path=/api/v1/reports/**
           filters:
+            - RewritePath=/api/v1/reports/(?<segment>.*), /${segment}
             - name: JwtValidationFilter
             - name: RequestRateLimiter
               args:
                 redis-rate-limiter.replenishRate: 2
                 redis-rate-limiter.burstCapacity: 5
                 redis-rate-limiter.include-headers: true
-                key-resolver: "#{@ipKeyResolver}"
+                key-resolver: "#{@userKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
             - name: CorrelationIdFilter
             - name: CircuitBreaker
               args:
                 name: reportServiceCB
                 fallbackUri: forward:/error
+          metadata:
+            owner: reporting-team
+            sla: P2
+            response-timeout: 30s   # reports may take longer
+            connect-timeout: 5s
+
+        - id: accounting-service
+          uri: http://${ACCOUNTING_SERVICE_URI:localhost}:9006
+          predicates:
+            - Path=/api/v1/accounting/**
+          filters:
+            - RewritePath=/api/v1/accounting/(?<segment>.*), /${segment}
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+                redis-rate-limiter.includeHeaders: true
+          metadata:
+            owner: finance-team
+            sla: P2
+
+        - id: notification-service
+          uri: http://${URI:localhost}:9007
+          predicates:
+            - Path=/api/v1/notifications/**
+          filters:
+            - RewritePath=/api/v1/notifications/(?<segment>.*), /${segment}
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userKeyResolver}"
+                rate-limiter: "#{@failOpenRedisRateLimiter}"
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+                redis-rate-limiter.includeHeaders: true
+          metadata:
+            owner: platform-team
+            sla: P3
+            response-timeout: 15s
+            connect-timeout: 3s
 
 gateway:
   cors:
-    allowed-origins: http://localhost:3000,http://localhost:3001
+    allowed-origins: "${CORS_ALLOWED_ORIGINS:http://localhost:3000}"
+    allowed-methods: "${CORS_ALLOWED_METHODS:GET,POST,PUT,DELETE,OPTIONS}"
+    allowed-headers: "${CORS_ALLOWED_HEADERS:Content-Type,Authorization,X-Requested-With,X-Correlation-ID}"
+    allow-credentials: ${CORS_ALLOW_CREDENTIALS:false}
   jwt:
-    public-key-path: ${JWT_PUBLIC_KEY_PATH:classpath:certs/public.pem}
+    public-keys-path: ${JWT_PUBLIC_KEY_PATH:classpath:certs/*.pem}
+    blacklist:
+      enabled: ${GATEWAY_JWT_BLACKLIST_ENABLED:true}
+    clock-skew-seconds: 60
 
 management:
   tracing:
     sampling:
-      probability: 1.0
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
   zipkin:
     tracing:
       endpoint: ${ZIPKIN_URL:http://localhost:9411/api/v2/spans}
@@ -168,3 +274,42 @@ management:
       show-details: when-authorized
       probes:
         enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles:
+        http.server.requests: 0.5,0.9,0.95,0.99
+      percentiles-histogram:
+        http.server.requests: true
+
+resilience4j.circuitbreaker:
+  instances:
+    trade-service:
+      slidingWindowType: COUNT_BASED
+      slidingWindowSize: 10
+      failureRateThreshold: 50
+      waitDurationInOpenState: 10s
+    report-service:
+      slidingWindowType: COUNT_BASED
+      slidingWindowSize: 10
+      failureRateThreshold: 50
+      waitDurationInOpenState: 10s
+    payment-service:
+      slidingWindowType: COUNT_BASED
+      slidingWindowSize: 10
+      failureRateThreshold: 50
+      waitDurationInOpenState: 10s
+
+resilience4j.timelimiter:
+  instances:
+    trade-service:
+      timeoutDuration: 15s
+      cancelRunningFuture: true
+    report-service:
+      timeoutDuration: 30s
+      cancelRunningFuture: true
+    payment-service:
+      timeoutDuration: 20s
+      cancelRunningFuture: true
+
